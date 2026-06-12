@@ -5,11 +5,11 @@ import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 export default function (pi: ExtensionAPI) {
 	let maxContextTokens: number | null = null;
 	let footerSet = false;
+	let compactionInFlight = false;
 
 	// ── Parse token values like "256k", "128000", "1m" ──
-	function parseTokenValue(input: string): number | null {
+	function parseTokenValue(input: string): number | undefined {
 		const trimmed = input.trim().toLowerCase();
-		if (trimmed === "off" || trimmed === "none" || trimmed === "0") return null;
 
 		const kMatch = trimmed.match(/^(\d+(?:\.\d+)?)k$/);
 		if (kMatch) return Math.round(parseFloat(kMatch[1]) * 1000);
@@ -19,13 +19,42 @@ export default function (pi: ExtensionAPI) {
 
 		const num = parseInt(trimmed, 10);
 		if (!isNaN(num) && num > 0) return num;
-		return null;
+		return undefined;
 	}
 
 	function fmt(n: number): string {
 		if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
 		if (n >= 1000) return `${(n / 1000).toFixed(0)}k`;
 		return String(n);
+	}
+
+	function isDisableValue(input: string): boolean {
+		const trimmed = input.trim().toLowerCase();
+		return trimmed === "off" || trimmed === "none" || trimmed === "0";
+	}
+
+	async function maybeCompact(
+		ctx: Parameters<Parameters<typeof pi.on>[1]>[1],
+		reason: string,
+	): Promise<void> {
+		if (maxContextTokens === null || compactionInFlight) return;
+
+		const usage = ctx.getContextUsage();
+		if (!usage || typeof usage.tokens !== "number") return;
+
+		const buffer = Math.max(8192, Math.min(16384, Math.floor(maxContextTokens * 0.1)));
+		const threshold = maxContextTokens - buffer;
+		if (usage.tokens <= threshold) return;
+
+		compactionInFlight = true;
+		try {
+			ctx.ui.notify(`Context at ${fmt(usage.tokens)} / ${fmt(maxContextTokens)} — ${reason}`, "info");
+			await ctx.compact({
+				customInstructions: `Compact the conversation to keep total context under ${maxContextTokens} tokens. Preserve all important decisions, code changes, and next steps.`,
+			});
+		} finally {
+			compactionInFlight = false;
+		}
 	}
 
 	// ── Install custom footer ──
@@ -57,7 +86,7 @@ export default function (pi: ExtensionAPI) {
 						}
 					}
 
-					const cacheHit =
+					const cacheReadShare =
 						cacheRead + cacheWrite > 0
 							? ((cacheRead / (cacheRead + cacheWrite)) * 100).toFixed(1)
 							: "0.0";
@@ -67,7 +96,7 @@ export default function (pi: ExtensionAPI) {
 						theme.fg("dim", `↓${fmt(output)}`),
 						theme.fg("dim", `R${fmt(cacheRead)}`),
 						theme.fg("dim", `W${fmt(cacheWrite)}`),
-						theme.fg("dim", `CH${cacheHit}%`),
+						theme.fg("dim", `CR${cacheReadShare}%`),
 						theme.fg("dim", `$${cost.toFixed(3)}`),
 					];
 
@@ -87,7 +116,9 @@ export default function (pi: ExtensionAPI) {
 					stats.push(theme.fg("dim", contextDisplay));
 
 					// ── Auto-compaction indicator ──
-					stats.push(theme.fg("dim", "(auto)"));
+					if (maxContextTokens !== null) {
+						stats.push(theme.fg("dim", "(auto)"));
+					}
 
 					// ── Extension statuses (inline) ──
 					for (const [, text] of footerData.getExtensionStatuses()) {
@@ -97,7 +128,7 @@ export default function (pi: ExtensionAPI) {
 					// ── Model info ──
 					const modelId = ctx.model?.id ?? "no-model";
 					const provider = ctx.model?.provider;
-					const thinking = (ctx as any).thinkingLevel;
+					const thinking = (ctx as { thinkingLevel?: string }).thinkingLevel;
 					const modelParts: string[] = [];
 					if (provider) modelParts.push(theme.fg("dim", `(${provider})`));
 					modelParts.push(theme.fg("dim", modelId));
@@ -132,8 +163,14 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 
+			if (isDisableValue(args)) {
+				maxContextTokens = null;
+				ctx.ui.notify("Max context auto-compaction disabled.", "info");
+				return;
+			}
+
 			const parsed = parseTokenValue(args);
-			if (parsed === null) {
+			if (parsed === undefined) {
 				ctx.ui.notify(
 					"Invalid format. Use e.g. /max-context 256k, /max-context 128000, or /max-context off",
 					"error",
@@ -149,48 +186,9 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
-	// ── Check context usage after each turn ──
-	pi.on("turn_end", async (_event, ctx) => {
-		if (maxContextTokens === null) return;
-
-		const usage = ctx.getContextUsage();
-		if (!usage || typeof usage.tokens !== "number") return;
-
-		const buffer = Math.max(8192, Math.min(16384, Math.floor(maxContextTokens * 0.1)));
-		const threshold = maxContextTokens - buffer;
-
-		if (usage.tokens > threshold) {
-			ctx.ui.notify(
-				`Context at ${fmt(usage.tokens)} / ${fmt(maxContextTokens)} — compacting...`,
-				"info",
-			);
-
-			ctx.compact({
-				customInstructions: `Compact the conversation to keep total context under ${maxContextTokens} tokens. Preserve all important decisions, code changes, and next steps.`,
-			});
-		}
-	});
-
-	// ── Also check before each LLM call ──
+	// ── Check context usage before each LLM call ──
 	pi.on("turn_start", async (_event, ctx) => {
-		if (maxContextTokens === null) return;
-
-		const usage = ctx.getContextUsage();
-		if (!usage || typeof usage.tokens !== "number") return;
-
-		const buffer = Math.max(8192, Math.min(16384, Math.floor(maxContextTokens * 0.1)));
-		const threshold = maxContextTokens - buffer;
-
-		if (usage.tokens > threshold) {
-			ctx.ui.notify(
-				`Context at ${fmt(usage.tokens)} / ${fmt(maxContextTokens)} — compacting before next turn...`,
-				"info",
-			);
-
-			ctx.compact({
-				customInstructions: `Compact the conversation to keep total context under ${maxContextTokens} tokens. Preserve all important decisions, code changes, and next steps.`,
-			});
-		}
+		await maybeCompact(ctx, "compacting before next turn...");
 	});
 
 	// ── Install footer on session start ──
