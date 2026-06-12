@@ -1,30 +1,49 @@
-import type { AssistantMessage } from "@earendil-works/pi-ai";
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
+import type { ImageContent, TextContent } from "@earendil-works/pi-ai";
+import type { ExtensionAPI, ExtensionContext, InputEvent } from "@earendil-works/pi-coding-agent";
+
+const STATUS_ID = "max-context";
+const MIN_BUFFER_TOKENS = 512;
+const MAX_BUFFER_TOKENS = 16_384;
+
+type PendingUserInput = {
+	text: string;
+	images?: ImageContent[];
+};
 
 export default function (pi: ExtensionAPI) {
 	let maxContextTokens: number | null = null;
-	let footerSet = false;
 	let compactionInFlight = false;
+	let lastCompactionStartedAtTokens: number | null = null;
+	let pendingUserInputs: PendingUserInput[] = [];
 
-	// ── Parse token values like "256k", "128000", "1m" ──
+	// Parse token values like "256k", "128000", "1.5m".
 	function parseTokenValue(input: string): number | undefined {
 		const trimmed = input.trim().toLowerCase();
 
-		const kMatch = trimmed.match(/^(\d+(?:\.\d+)?)k$/);
-		if (kMatch) return Math.round(parseFloat(kMatch[1]) * 1000);
+		const suffixMatch = trimmed.match(/^(\d+(?:\.\d+)?)([km])$/);
+		if (suffixMatch) {
+			const value = Number(suffixMatch[1]);
+			if (!Number.isFinite(value) || value <= 0) return undefined;
 
-		const mMatch = trimmed.match(/^(\d+(?:\.\d+)?)m$/);
-		if (mMatch) return Math.round(parseFloat(mMatch[1]) * 1_000_000);
+			const multiplier = suffixMatch[2] === "k" ? 1000 : 1_000_000;
+			const tokens = Math.round(value * multiplier);
+			return Number.isSafeInteger(tokens) && tokens > 0 ? tokens : undefined;
+		}
 
-		const num = parseInt(trimmed, 10);
-		if (!isNaN(num) && num > 0) return num;
-		return undefined;
+		if (!/^\d+$/.test(trimmed)) return undefined;
+		const tokens = Number(trimmed);
+		return Number.isSafeInteger(tokens) && tokens > 0 ? tokens : undefined;
 	}
 
 	function fmt(n: number): string {
-		if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
-		if (n >= 1000) return `${(n / 1000).toFixed(0)}k`;
+		if (n >= 1_000_000) {
+			const value = n / 1_000_000;
+			return `${Number.isInteger(value) ? value.toFixed(0) : value.toFixed(1)}M`;
+		}
+		if (n >= 1000) {
+			const value = n / 1000;
+			return `${n >= 10_000 || Number.isInteger(value) ? value.toFixed(0) : value.toFixed(1)}k`;
+		}
 		return String(n);
 	}
 
@@ -33,145 +52,178 @@ export default function (pi: ExtensionAPI) {
 		return trimmed === "off" || trimmed === "none" || trimmed === "0";
 	}
 
-	async function maybeCompact(
-		ctx: Parameters<Parameters<typeof pi.on>[1]>[1],
-		reason: string,
-	): Promise<void> {
-		if (maxContextTokens === null || compactionInFlight) return;
-
-		const usage = ctx.getContextUsage();
-		if (!usage || typeof usage.tokens !== "number") return;
-
-		const buffer = Math.max(8192, Math.min(16384, Math.floor(maxContextTokens * 0.1)));
-		const threshold = maxContextTokens - buffer;
-		if (usage.tokens <= threshold) return;
-
-		compactionInFlight = true;
-		try {
-			ctx.ui.notify(`Context at ${fmt(usage.tokens)} / ${fmt(maxContextTokens)} — ${reason}`, "info");
-			await ctx.compact({
-				customInstructions: `Compact the conversation to keep total context under ${maxContextTokens} tokens. Preserve all important decisions, code changes, and next steps.`,
-			});
-		} finally {
-			compactionInFlight = false;
-		}
+	function notify(ctx: ExtensionContext, message: string, type: "info" | "warning" | "error" = "info") {
+		if (ctx.hasUI) ctx.ui.notify(message, type);
 	}
 
-	// ── Install custom footer ──
-	function installFooter(ctx: Parameters<Parameters<typeof pi.on>[1]>[1]) {
-		if (footerSet) return;
-		footerSet = true;
+	function getUsageTokens(ctx: ExtensionContext): number | null {
+		const usage = ctx.getContextUsage();
+		return usage && typeof usage.tokens === "number" ? usage.tokens : null;
+	}
 
-		ctx.ui.setFooter((tui, theme, footerData) => {
-			const unsubBranch = footerData.onBranchChange(() => tui.requestRender());
+	function getBuffer(limit: number): number {
+		const tenPercent = Math.floor(limit * 0.1);
+		const desired = Math.max(MIN_BUFFER_TOKENS, Math.min(MAX_BUFFER_TOKENS, tenPercent));
+		return Math.max(1, Math.min(desired, Math.floor(limit / 2)));
+	}
 
-			return {
-				dispose: unsubBranch,
-				invalidate() {},
-				render(width: number): string[] {
-					// ── Token / cache / cost stats ──
-					let input = 0,
-						output = 0,
-						cacheRead = 0,
-						cacheWrite = 0,
-						cost = 0;
-					for (const e of ctx.sessionManager.getBranch()) {
-						if (e.type === "message" && e.message.role === "assistant") {
-							const m = e.message as AssistantMessage;
-							input += m.usage.input;
-							output += m.usage.output;
-							cacheRead += m.usage.cacheRead ?? 0;
-							cacheWrite += m.usage.cacheWrite ?? 0;
-							cost += m.usage.cost.total;
-						}
-					}
+	function getThreshold(limit: number): number {
+		return Math.max(0, limit - getBuffer(limit));
+	}
 
-					const cacheReadShare =
-						cacheRead + cacheWrite > 0
-							? ((cacheRead / (cacheRead + cacheWrite)) * 100).toFixed(1)
-							: "0.0";
+	function getCompactionDecision(ctx: ExtensionContext):
+		| { shouldCompact: false }
+		| { shouldCompact: true; tokens: number; threshold: number; buffer: number } {
+		if (maxContextTokens === null) return { shouldCompact: false };
 
-					const stats = [
-						theme.fg("dim", `↑${fmt(input)}`),
-						theme.fg("dim", `↓${fmt(output)}`),
-						theme.fg("dim", `R${fmt(cacheRead)}`),
-						theme.fg("dim", `W${fmt(cacheWrite)}`),
-						theme.fg("dim", `CR${cacheReadShare}%`),
-						theme.fg("dim", `$${cost.toFixed(3)}`),
-					];
+		const tokens = getUsageTokens(ctx);
+		if (tokens === null) return { shouldCompact: false };
 
-					// ── Context usage ──
-					const usage = ctx.getContextUsage();
-					const currentTokens = usage?.tokens ?? 0;
-					const modelWindow = ctx.model?.contextWindow ?? 0;
+		const buffer = getBuffer(maxContextTokens);
+		const threshold = getThreshold(maxContextTokens);
+		if (tokens <= threshold) {
+			lastCompactionStartedAtTokens = null;
+			return { shouldCompact: false };
+		}
 
-					let contextDisplay: string;
-					if (maxContextTokens !== null && maxContextTokens > 0) {
-						const pct = ((currentTokens / maxContextTokens) * 100).toFixed(1);
-						contextDisplay = `${pct}%/${fmt(maxContextTokens)}(${fmt(modelWindow)})`;
-					} else {
-						const pct = modelWindow > 0 ? ((currentTokens / modelWindow) * 100).toFixed(1) : "0.0";
-						contextDisplay = `${pct}%/${fmt(modelWindow)}`;
-					}
-					stats.push(theme.fg("dim", contextDisplay));
+		// If the last compaction did not reduce usage enough, avoid tight retry loops.
+		const retryDelta = Math.max(buffer, Math.floor(maxContextTokens * 0.05));
+		if (lastCompactionStartedAtTokens !== null && tokens <= lastCompactionStartedAtTokens + retryDelta) {
+			return { shouldCompact: false };
+		}
 
-					// ── Auto-compaction indicator ──
-					if (maxContextTokens !== null) {
-						stats.push(theme.fg("dim", "(auto)"));
-					}
+		return { shouldCompact: true, tokens, threshold, buffer };
+	}
 
-					// ── Extension statuses (inline) ──
-					for (const [, text] of footerData.getExtensionStatuses()) {
-						if (text) stats.push(text);
-					}
+	function getStatusText(ctx: ExtensionContext): string | undefined {
+		if (maxContextTokens === null) return undefined;
 
-					// ── Model info ──
-					const modelId = ctx.model?.id ?? "no-model";
-					const provider = ctx.model?.provider;
-					const thinking = (ctx as { thinkingLevel?: string }).thinkingLevel;
-					const modelParts: string[] = [];
-					if (provider) modelParts.push(theme.fg("dim", `(${provider})`));
-					modelParts.push(theme.fg("dim", modelId));
-					if (thinking && thinking !== "off") modelParts.push(theme.fg("dim", `• ${thinking}`));
+		const usage = ctx.getContextUsage();
+		const tokens = usage && typeof usage.tokens === "number" ? usage.tokens : null;
+		const contextWindow = usage?.contextWindow || ctx.model?.contextWindow;
+		const state = compactionInFlight ? "compacting…" : "auto";
+		const usageText =
+			tokens === null
+				? `ctx ?/${fmt(maxContextTokens)}`
+				: `ctx ${((tokens / maxContextTokens) * 100).toFixed(1)}%/${fmt(maxContextTokens)}`;
+		const windowText = contextWindow ? ` (${fmt(contextWindow)} window)` : "";
+		return `${usageText}${windowText} ${state}`;
+	}
 
-					// ── Assemble line ──
-					const left = stats.join(" ");
-					const right = modelParts.join(" ");
-					const pad = " ".repeat(Math.max(1, width - visibleWidth(left) - visibleWidth(right)));
-					return [truncateToWidth(left + pad + right, width)];
-				},
-			};
+	function updateStatus(ctx: ExtensionContext) {
+		if (!ctx.hasUI) return;
+		ctx.ui.setStatus(STATUS_ID, getStatusText(ctx));
+	}
+
+	function contentForPendingInput(input: PendingUserInput): string | (TextContent | ImageContent)[] {
+		if (!input.images?.length) return input.text;
+
+		const content: (TextContent | ImageContent)[] = [];
+		if (input.text.trim().length > 0) content.push({ type: "text", text: input.text });
+		content.push(...input.images);
+		return content;
+	}
+
+	function enqueueUserInput(event: InputEvent) {
+		pendingUserInputs.push({
+			text: event.text,
+			images: event.images ? [...event.images] : undefined,
 		});
 	}
 
-	// ── /max-context command ──
+	function flushPendingUserInputs(ctx: ExtensionContext) {
+		if (pendingUserInputs.length === 0) return;
+
+		const queued = pendingUserInputs;
+		pendingUserInputs = [];
+
+		for (let i = 0; i < queued.length; i++) {
+			try {
+				pi.sendUserMessage(contentForPendingInput(queued[i]), i === 0 ? undefined : { deliverAs: "followUp" });
+			} catch (error) {
+				const message = error instanceof Error ? error.message : String(error);
+				notify(ctx, `Failed to resume queued message after compaction: ${message}`, "error");
+			}
+		}
+	}
+
+	function startCompaction(ctx: ExtensionContext, reason: string): boolean {
+		if (maxContextTokens === null || compactionInFlight) return false;
+
+		const decision = getCompactionDecision(ctx);
+		if (!decision.shouldCompact) {
+			updateStatus(ctx);
+			return false;
+		}
+
+		compactionInFlight = true;
+		lastCompactionStartedAtTokens = decision.tokens;
+		updateStatus(ctx);
+
+		notify(
+			ctx,
+			`Context at ${fmt(decision.tokens)} / ${fmt(maxContextTokens)}; ${reason}`,
+			"info",
+		);
+
+		try {
+			ctx.compact({
+				customInstructions: `Compact the conversation to keep total context near the configured soft limit of ${maxContextTokens} tokens. Preserve all important decisions, code changes, and next steps.`,
+				onComplete: () => {
+					compactionInFlight = false;
+					updateStatus(ctx);
+					notify(ctx, "Context compaction completed.", "info");
+					flushPendingUserInputs(ctx);
+				},
+				onError: (error) => {
+					compactionInFlight = false;
+					updateStatus(ctx);
+					notify(ctx, `Context compaction failed: ${error.message}`, "error");
+					flushPendingUserInputs(ctx);
+				},
+			});
+			return true;
+		} catch (error) {
+			compactionInFlight = false;
+			updateStatus(ctx);
+			const message = error instanceof Error ? error.message : String(error);
+			notify(ctx, `Context compaction failed: ${message}`, "error");
+			return false;
+		}
+	}
+
 	pi.registerCommand("max-context", {
 		description:
-			"Set a hard cap on context usage. Auto-compacts before exceeding the limit. Usage: /max-context 256k, /max-context 128000, /max-context off",
+			"Set a soft context limit. Auto-compacts near the limit. Usage: /max-context 256k, /max-context 128000, /max-context off",
 		handler: async (args, ctx) => {
-			installFooter(ctx);
-
 			if (!args || args.trim() === "") {
 				if (maxContextTokens !== null) {
-					ctx.ui.notify(
-						`Max context: ${fmt(maxContextTokens)} (${maxContextTokens.toLocaleString()} tokens). Use /max-context off to clear.`,
+					const tokens = getUsageTokens(ctx);
+					const current = tokens === null ? "current usage unknown" : `currently ${fmt(tokens)}`;
+					notify(
+						ctx,
+						`Max context soft limit: ${fmt(maxContextTokens)} (${maxContextTokens.toLocaleString()} tokens), ${current}. Use /max-context off to clear.`,
 						"info",
 					);
 				} else {
-					ctx.ui.notify("No max context set. Usage: /max-context 256k", "info");
+					notify(ctx, "No max context soft limit set. Usage: /max-context 256k", "info");
 				}
+				updateStatus(ctx);
 				return;
 			}
 
 			if (isDisableValue(args)) {
 				maxContextTokens = null;
-				ctx.ui.notify("Max context auto-compaction disabled.", "info");
+				lastCompactionStartedAtTokens = null;
+				updateStatus(ctx);
+				notify(ctx, "Max context auto-compaction disabled.", "info");
 				return;
 			}
 
 			const parsed = parseTokenValue(args);
 			if (parsed === undefined) {
-				ctx.ui.notify(
+				notify(
+					ctx,
 					"Invalid format. Use e.g. /max-context 256k, /max-context 128000, or /max-context off",
 					"error",
 				);
@@ -179,20 +231,60 @@ export default function (pi: ExtensionAPI) {
 			}
 
 			maxContextTokens = parsed;
-			ctx.ui.notify(
-				`Max context set to ${fmt(parsed)} (${parsed.toLocaleString()} tokens). Will auto-compact before exceeding this limit.`,
+			lastCompactionStartedAtTokens = null;
+			updateStatus(ctx);
+
+			notify(
+				ctx,
+				`Max context soft limit set to ${fmt(parsed)} (${parsed.toLocaleString()} tokens). Will auto-compact near this limit.`,
 				"info",
 			);
+			startCompaction(ctx, "compacting after setting a lower limit...");
 		},
 	});
 
-	// ── Check context usage before each LLM call ──
-	pi.on("turn_start", async (_event, ctx) => {
-		await maybeCompact(ctx, "compacting before next turn...");
+	// If a prompt arrives while compaction is needed or in progress, hold it and replay it after compaction.
+	pi.on("input", (event, ctx) => {
+		if (event.source === "extension" || maxContextTokens === null || !ctx.isIdle()) {
+			return { action: "continue" };
+		}
+
+		updateStatus(ctx);
+
+		if (compactionInFlight) {
+			enqueueUserInput(event);
+			notify(ctx, "Context compaction is still running; queued your message.", "info");
+			return { action: "handled" };
+		}
+
+		if (!getCompactionDecision(ctx).shouldCompact) return { action: "continue" };
+
+		const pendingStart = pendingUserInputs.length;
+		enqueueUserInput(event);
+		if (startCompaction(ctx, "compacting before processing your message...")) {
+			notify(ctx, "Queued your message until compaction finishes.", "info");
+			return { action: "handled" };
+		}
+
+		pendingUserInputs.splice(pendingStart);
+		return { action: "continue" };
 	});
 
-	// ── Install footer on session start ──
+	// After each completed prompt, compact while idle if the soft limit was crossed.
+	pi.on("agent_end", async (_event, ctx) => {
+		updateStatus(ctx);
+		startCompaction(ctx, "compacting while idle before the next prompt...");
+	});
+
+	pi.on("model_select", async (_event, ctx) => {
+		updateStatus(ctx);
+	});
+
+	pi.on("session_compact", async (_event, ctx) => {
+		updateStatus(ctx);
+	});
+
 	pi.on("session_start", async (_event, ctx) => {
-		installFooter(ctx);
+		updateStatus(ctx);
 	});
 }

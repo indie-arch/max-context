@@ -1,0 +1,5 @@
+.npmrc
+.git/
+node_modules/
+*.tgz
+.DS_Store

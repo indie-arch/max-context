@@ -1,17 +1,22 @@
 {
-     "name": "max-context",
-     "version": "1.0.1",
-     "description": "Pi extension to cap context usage with /max-context command",
-     "keywords": [
-          "pi-package"
-     ],
-     "repository": {
-          "type": "git",
-          "url": "git+https://github.com/indie-arch/max-context.git"
-     },
-     "pi": {
-          "extensions": [
-               "./extensions"
-          ]
-     }
+  "name": "max-context",
+  "version": "1.0.2",
+  "description": "Pi extension to keep context usage near a configurable soft limit",
+  "keywords": [
+    "pi-package"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/indie-arch/max-context.git"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*"
+  },
+  "pi": {
+    "extensions": [
+      "./extensions"
+    ]
+  }
 }
