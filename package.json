@@ -1,13 +1,17 @@
-   {
+{
      "name": "max-context",
-     "version": "1.0.0",
+     "version": "1.0.1",
      "description": "Pi extension to cap context usage with /max-context command",
-     "keywords": ["pi-package"],
+     "keywords": [
+          "pi-package"
+     ],
      "repository": {
-       "type": "git",
-       "url": "git+https://github.com/indie-arch/max-context.git"
+          "type": "git",
+          "url": "git+https://github.com/indie-arch/max-context.git"
      },
      "pi": {
-       "extensions": ["./extensions"]
+          "extensions": [
+               "./extensions"
+          ]
      }
-   }
+}
