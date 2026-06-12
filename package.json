@@ -1,0 +1,9 @@
+{
+  "name": "max-context",
+  "version": "1.0.0",
+  "description": "Pi extension to cap context usage with /max-context command",
+  "keywords": ["pi-package"],
+  "pi": {
+    "extensions": ["./extensions"]
+  }
+}
