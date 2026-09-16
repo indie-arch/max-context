@@ -12,6 +12,7 @@ type PendingUserInput = {
 
 export default function (pi: ExtensionAPI) {
 	let maxContextTokens: number | null = null;
+	let showStatus = true;
 	let compactionInFlight = false;
 	let lastCompactionStartedAtTokens: number | null = null;
 	let pendingUserInputs: PendingUserInput[] = [];
@@ -96,7 +97,7 @@ export default function (pi: ExtensionAPI) {
 	}
 
 	function getStatusText(ctx: ExtensionContext): string | undefined {
-		if (maxContextTokens === null) return undefined;
+		if (!showStatus || maxContextTokens === null) return undefined;
 
 		const usage = ctx.getContextUsage();
 		const tokens = usage && typeof usage.tokens === "number" ? usage.tokens : null;
@@ -194,7 +195,7 @@ export default function (pi: ExtensionAPI) {
 
 	pi.registerCommand("max-context", {
 		description:
-			"Set a soft context limit. Auto-compacts near the limit. Usage: /max-context 256k, /max-context 128000, /max-context off",
+			"Set a soft context limit. Auto-compacts near the limit. Usage: /max-context 256k, /max-context off, /max-context status on|off",
 		handler: async (args, ctx) => {
 			if (!args || args.trim() === "") {
 				if (maxContextTokens !== null) {
@@ -212,6 +213,18 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 
+			const [option, value, ...extra] = args.trim().toLowerCase().split(/\s+/);
+			if (option === "status") {
+				if ((value !== "on" && value !== "off") || extra.length > 0) {
+					notify(ctx, "Usage: /max-context status on|off", "error");
+					return;
+				}
+				showStatus = value === "on";
+				updateStatus(ctx);
+				notify(ctx, `Max context status bar display ${showStatus ? "enabled" : "disabled"}.`, "info");
+				return;
+			}
+
 			if (isDisableValue(args)) {
 				maxContextTokens = null;
 				lastCompactionStartedAtTokens = null;
@@ -224,7 +237,7 @@ export default function (pi: ExtensionAPI) {
 			if (parsed === undefined) {
 				notify(
 					ctx,
-					"Invalid format. Use e.g. /max-context 256k, /max-context 128000, or /max-context off",
+					"Invalid format. Use e.g. /max-context 256k, /max-context off, or /max-context status on|off",
 					"error",
 				);
 				return;
