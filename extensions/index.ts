@@ -16,6 +16,7 @@ export default function (pi: ExtensionAPI) {
 	let compactionInFlight = false;
 	let lastCompactionStartedAtTokens: number | null = null;
 	let pendingUserInputs: PendingUserInput[] = [];
+	let sessionGeneration = 0;
 
 	// Parse token values like "256k", "128000", "1.5m".
 	function parseTokenValue(input: string): number | undefined {
@@ -140,7 +141,10 @@ export default function (pi: ExtensionAPI) {
 
 		for (let i = 0; i < queued.length; i++) {
 			try {
-				pi.sendUserMessage(contentForPendingInput(queued[i]), i === 0 ? undefined : { deliverAs: "followUp" });
+				pi.sendUserMessage(contentForPendingInput(queued[i]), {
+					expandPromptTemplates: true,
+					deliverAs: i === 0 ? undefined : "followUp",
+				});
 			} catch (error) {
 				const message = error instanceof Error ? error.message : String(error);
 				notify(ctx, `Failed to resume queued message after compaction: ${message}`, "error");
@@ -158,6 +162,7 @@ export default function (pi: ExtensionAPI) {
 		}
 
 		compactionInFlight = true;
+		const generation = sessionGeneration;
 		lastCompactionStartedAtTokens = decision.tokens;
 		updateStatus(ctx);
 
@@ -170,13 +175,20 @@ export default function (pi: ExtensionAPI) {
 		try {
 			ctx.compact({
 				customInstructions: `Compact the conversation to keep total context near the configured soft limit of ${maxContextTokens} tokens. Preserve all important decisions, code changes, and next steps.`,
-				onComplete: () => {
+				onComplete: (result) => {
+					if (generation !== sessionGeneration) return;
+					const tokensAfter = result.estimatedTokensAfter ?? getUsageTokens(ctx);
+					lastCompactionStartedAtTokens =
+						maxContextTokens === null || tokensAfter === null || tokensAfter <= getThreshold(maxContextTokens)
+							? null
+							: tokensAfter;
 					compactionInFlight = false;
 					updateStatus(ctx);
 					notify(ctx, "Context compaction completed.", "info");
 					flushPendingUserInputs(ctx);
 				},
 				onError: (error) => {
+					if (generation !== sessionGeneration) return;
 					compactionInFlight = false;
 					updateStatus(ctx);
 					notify(ctx, `Context compaction failed: ${error.message}`, "error");
@@ -258,7 +270,7 @@ export default function (pi: ExtensionAPI) {
 
 	// If a prompt arrives while compaction is needed or in progress, hold it and replay it after compaction.
 	pi.on("input", (event, ctx) => {
-		if (event.source === "extension" || maxContextTokens === null || !ctx.isIdle()) {
+		if (event.source === "extension") {
 			return { action: "continue" };
 		}
 
@@ -269,6 +281,8 @@ export default function (pi: ExtensionAPI) {
 			notify(ctx, "Context compaction is still running; queued your message.", "info");
 			return { action: "handled" };
 		}
+
+		if (maxContextTokens === null || !ctx.isIdle()) return { action: "continue" };
 
 		if (!getCompactionDecision(ctx).shouldCompact) return { action: "continue" };
 
@@ -298,6 +312,10 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.on("session_start", async (_event, ctx) => {
+		sessionGeneration++;
+		compactionInFlight = false;
+		lastCompactionStartedAtTokens = null;
+		pendingUserInputs = [];
 		updateStatus(ctx);
 	});
 }

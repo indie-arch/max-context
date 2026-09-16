@@ -13,9 +13,15 @@ Pi extension to keep context usage near a configurable soft limit with a `/max-c
 
 Status visibility does not affect auto-compaction. The preference lasts for the current Pi process and resets to shown on restart. Status info is only displayed when a soft limit is set.
 
-When enabled, the extension auto-compacts after a prompt finishes if context usage approaches the configured limit. If you send the next prompt while compaction is still needed or running, the extension queues that prompt and replays it after compaction completes.
+When enabled, the extension auto-compacts after a prompt finishes if context usage approaches the configured limit. A prompt that triggers compaction is held and replayed afterward, with skill and prompt-template expansion preserved. While compaction is running, Pi's interactive UI queues new submissions; the extension also holds input events delivered before its compaction callback completes. RPC/API clients must wait for compaction to finish before submitting prompts, as Pi rejects those submissions before extension input handlers run.
 
 This is a soft limit: Pi's compaction settings, current model, system prompt, tools, and recent messages determine the final context size.
+
+Successful compaction rearms the soft limit using the resulting context size. If compaction fails or leaves usage above the threshold, retries wait for further growth to avoid a loop. Switching sessions clears pending input and compaction retry state; the configured limit remains enabled.
+
+## Development
+
+Run `npm test` with Node.js 22.13+ (or Node.js 24+) for the compaction and input-queue regression tests.
 
 ## Install
 
