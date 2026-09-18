@@ -1,6 +1,6 @@
 {
   "name": "max-context",
-  "version": "1.0.2",
+  "version": "1.0.3",
   "description": "Pi extension to keep context usage near a configurable soft limit",
   "keywords": [
     "pi-package"
